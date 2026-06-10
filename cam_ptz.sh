@@ -38,6 +38,7 @@
 #   Audio mode (group 0x05):
 #     SET: 09 05 00 03 00 01 00 01 XX    XX: 01=NC, 02=live, 03=original
 #     QRY: 09 05 00 04
+#     RSP: 09 05 00 04 00 01 00 01 XX    XX: 01=NC, 02=live, 03=original
 #
 # Anti-flicker uses standard UVC control (power_line_frequency) via v4l2-ctl.
 #
@@ -189,6 +190,75 @@ path.write_bytes(data.ljust(32, b"\x00"))
 PY
 }
 
+query_hid_hex() {
+    local hidraw
+    hidraw=$(find_hidraw)
+
+    if [[ ! -r "$hidraw" || ! -w "$hidraw" ]]; then
+        echo "Error: $hidraw is not readable and writable" >&2
+        echo "Hint: check the udev rule or run: ls -l $hidraw" >&2
+        return 1
+    fi
+
+    python3 - "$hidraw" "$@" <<'PY'
+import os
+import sys
+import time
+
+hidraw = sys.argv[1]
+try:
+    query = bytes(int(arg, 16) for arg in sys.argv[2:])
+except ValueError as exc:
+    raise SystemExit(f"Invalid HID hex byte: {exc}")
+
+if len(query) > 32:
+    raise SystemExit("HID report is longer than 32 bytes")
+
+fd = os.open(hidraw, os.O_RDWR | os.O_NONBLOCK)
+try:
+    while True:
+        try:
+            os.read(fd, 64)
+        except BlockingIOError:
+            break
+
+    os.write(fd, query.ljust(32, b"\x00"))
+
+    deadline = time.monotonic() + 0.75
+    while time.monotonic() < deadline:
+        try:
+            data = os.read(fd, 64)
+        except BlockingIOError:
+            time.sleep(0.05)
+            continue
+
+        if data:
+            print(data.hex(" "))
+            raise SystemExit(0)
+
+    raise SystemExit("no response")
+finally:
+    os.close(fd)
+PY
+}
+
+query_audio_state() {
+    local response mode
+
+    response=$(query_hid_hex 09 05 00 04) || return 1
+    mode=$(awk '{print $9}' <<<"$response")
+
+    case "$mode" in
+        01) AUDIO_STATE="nc" ;;
+        02) AUDIO_STATE="live" ;;
+        03) AUDIO_STATE="org" ;;
+        *) return 1 ;;
+    esac
+
+    save_state
+    echo "$AUDIO_STATE"
+}
+
 set_tracking() {
     local mode=$1
     send_hid_hex 09 01 01 00 00 01 00 01 "$mode"
@@ -220,13 +290,14 @@ set_audio_mode() {
     local mode=$1
     send_hid_hex 09 05 00 03 00 01 00 01 "$mode"
     sleep 0.2
-    send_hid_hex 09 05 00 04
 
     case "$mode" in
         01) AUDIO_STATE="nc" ;;
         02) AUDIO_STATE="live" ;;
         03) AUDIO_STATE="org" ;;
     esac
+
+    query_audio_state >/dev/null || true
     save_state
 }
 
@@ -244,8 +315,14 @@ print_device() {
 }
 
 sync_state() {
+    local state_source="local cache"
+
+    if query_audio_state >/dev/null; then
+        state_source="camera query for audio; local cache for tracking/gesture/auto"
+    fi
+
     save_state
-    echo "state source: local cache"
+    echo "state source: $state_source"
     echo "tracking=$TRACKING_STATE"
     echo "gesture=$GESTURE_STATE"
     echo "audio=$AUDIO_STATE"
@@ -295,6 +372,8 @@ case "${1:-help}" in
         ;;
     audio)
         if [[ $# -lt 2 ]]; then
+            query_audio_state >/dev/null || true
+
             case "$AUDIO_STATE" in
                 nc) set_audio_mode 02; echo "Audio: Live mode" ;;
                 live) set_audio_mode 03; echo "Audio: Original mode" ;;
@@ -375,6 +454,8 @@ case "${1:-help}" in
         set_ctrl zoom_absolute "$(clamp "$lvl" 100 150)"
         ;;
     status)
+        query_audio_state >/dev/null || true
+
         echo "pan:  $(($(get pan_absolute) / 3600)) deg"
         echo "tilt: $(($(get tilt_absolute) / 3600)) deg"
         echo "zoom: $(get zoom_absolute)"

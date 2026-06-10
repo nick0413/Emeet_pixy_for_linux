@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
-import glob
-import os
-import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+from pixy_control import PixyControlError, PixyController
 
 
 V4L2_SLIDERS = [
@@ -90,31 +89,6 @@ AUTOMATION_ACTIONS = [
 ]
 
 
-def run_cmd(cmd, env=None):
-    return subprocess.run(
-        cmd,
-        text=True,
-        capture_output=True,
-        check=True,
-        env=env,
-    )
-
-
-def find_pixy_hidraw():
-    for path in glob.glob("/sys/class/hidraw/hidraw*/device/uevent"):
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-        except OSError:
-            continue
-
-        if "HID_NAME=EMEET EMEET PIXY" in text:
-            hidraw_name = os.path.basename(os.path.dirname(os.path.dirname(path)))
-            return f"/dev/{hidraw_name}"
-
-    return None
-
-
 class ScrollableFrame(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
@@ -166,12 +140,13 @@ class ScrollableFrame(ttk.Frame):
 
 
 class PixyUI:
-    def __init__(self, root, device, script):
+    def __init__(self, root, device):
         self.root = root
         self.device = device
-        self.script = os.path.expanduser(script)
+        self.controller = PixyController(video_device=device)
         self.pending_jobs = {}
         self.slider_vars = {}
+        self.slider_widgets = {}
         self.bool_vars = {}
         self.custom_hid_command = tk.StringVar(value="status")
 
@@ -179,37 +154,19 @@ class PixyUI:
         root.geometry("900x720")
         root.minsize(760, 560)
 
-        self.hidraw = find_pixy_hidraw()
-
         self.build_ui()
 
     def v4l2_get(self, control_name, fallback):
-        try:
-            result = run_cmd([
-                "v4l2-ctl",
-                "-d",
-                self.device,
-                "--get-ctrl",
-                control_name,
-            ])
-            value = result.stdout.strip().split(":", 1)[1].strip()
-            return int(value)
-        except Exception:
-            return fallback
+        return self.controller.get_control(control_name, fallback)
 
     def v4l2_set(self, control_name, value):
         try:
-            run_cmd([
-                "v4l2-ctl",
-                "-d",
-                self.device,
-                "-c",
-                f"{control_name}={int(value)}",
-            ])
-        except subprocess.CalledProcessError as e:
+            self.controller.set_control(control_name, value)
+            self.refresh_manual_control_states()
+        except PixyControlError as e:
             messagebox.showerror(
                 "V4L2 error",
-                f"Failed to set {control_name}={value}\n\n{e.stderr.strip()}",
+                f"Failed to set {control_name}={value}\n\n{e}",
             )
 
     def schedule_v4l2_set(self, control_name, value):
@@ -227,44 +184,19 @@ class PixyUI:
             if name in self.slider_vars:
                 self.slider_vars[name].set(value)
 
-    def run_hid_action(self, action):
+    def run_pixy_action(self, action):
         action = action.strip()
         if not action:
             return
 
-        if not os.path.exists(self.script):
-            messagebox.showwarning(
-                "Missing HID script",
-                f"Could not find:\n\n{self.script}\n\n"
-                "Put cam_ptz.sh there, or launch this UI with:\n\n"
-                "python3 ~/pixy_ui.py --script /path/to/cam_ptz.sh",
-            )
-            return
-
-        args = action.split()
-
-        if os.access(self.script, os.X_OK):
-            cmd = [self.script] + args
-        else:
-            cmd = ["bash", self.script] + args
-
-        env = os.environ.copy()
-        if self.hidraw:
-            env["PIXY_HIDRAW"] = self.hidraw
-
         try:
-            result = run_cmd(cmd, env=env)
-
-            output = result.stdout.strip()
+            output = self.controller.run_command(action).strip()
             if action == "status" or output:
-                messagebox.showinfo("HID output", output or "Command completed.")
-
-        except subprocess.CalledProcessError as e:
+                messagebox.showinfo("PIXY output", output or "Command completed.")
+        except PixyControlError as e:
             messagebox.showerror(
-                "HID script error",
-                f"Command failed:\n\n{' '.join(cmd)}\n\n"
-                f"stdout:\n{e.stdout.strip()}\n\n"
-                f"stderr:\n{e.stderr.strip()}",
+                "PIXY control error",
+                f"Command failed:\n\n{action}\n\n{e}",
             )
 
     def build_ui(self):
@@ -275,8 +207,7 @@ class PixyUI:
         status.pack(fill="x", pady=(0, 10))
 
         ttk.Label(status, text=f"V4L2 video device: {self.device}").pack(anchor="w")
-        ttk.Label(status, text=f"PIXY HID device: {self.hidraw or 'not found'}").pack(anchor="w")
-        ttk.Label(status, text=f"HID helper script: {self.script}").pack(anchor="w")
+        ttk.Label(status, text=f"PIXY HID device: {self.controller.hidraw or 'not found'}").pack(anchor="w")
 
         notebook = ttk.Notebook(outer)
         notebook.pack(fill="both", expand=True)
@@ -386,6 +317,7 @@ class PixyUI:
                 command=lambda raw, n=name: self.schedule_v4l2_set(n, int(float(raw))),
             )
             scale.grid(row=row, column=1, sticky="ew", padx=4, pady=3)
+            self.slider_widgets[name] = scale
 
             ttk.Button(
                 sliders,
@@ -394,6 +326,26 @@ class PixyUI:
             ).grid(row=row, column=2, sticky="e", padx=4, pady=3)
 
         sliders.columnconfigure(1, weight=1)
+        self.refresh_manual_control_states()
+
+    def refresh_manual_control_states(self):
+        exposure_auto = self.v4l2_get("auto_exposure", 3)
+        auto_white_balance = self.bool_vars.get("white_balance_automatic")
+        auto_focus = self.bool_vars.get("focus_automatic_continuous")
+
+        states = {
+            "exposure_time_absolute": "normal" if exposure_auto == 1 else "disabled",
+            "white_balance_temperature": (
+                "normal" if auto_white_balance is not None and auto_white_balance.get() == 0 else "disabled"
+            ),
+            "focus_absolute": (
+                "normal" if auto_focus is not None and auto_focus.get() == 0 else "disabled"
+            ),
+        }
+
+        for name, state in states.items():
+            if name in self.slider_widgets:
+                self.slider_widgets[name].configure(state=state)
 
     def build_hid_tab(self, parent):
         page = ttk.Frame(parent, padding=10)
@@ -405,14 +357,14 @@ class PixyUI:
         ttk.Label(
             info,
             text=(
-                "These buttons call cam_ptz.sh. They control PIXY-specific HID features "
+                "These buttons use native Python control. They control PIXY-specific HID features "
                 "such as tracking, privacy, gestures, audio modes, auto-privacy, flicker, "
                 "device discovery, and local automation helpers."
             ),
             wraplength=820,
         ).pack(anchor="w")
 
-        buttons = ttk.LabelFrame(page, text="PIXY HID/script buttons", padding=10)
+        buttons = ttk.LabelFrame(page, text="PIXY control buttons", padding=10)
         buttons.pack(fill="x", pady=(0, 10))
 
         columns = 3
@@ -420,7 +372,7 @@ class PixyUI:
             ttk.Button(
                 buttons,
                 text=label,
-                command=lambda a=action: self.run_hid_action(a),
+                command=lambda a=action: self.run_pixy_action(a),
             ).grid(row=i // columns, column=i % columns, sticky="ew", padx=4, pady=4)
 
         for col in range(columns):
@@ -433,13 +385,13 @@ class PixyUI:
             ttk.Button(
                 automation,
                 text=label,
-                command=lambda a=action: self.run_hid_action(a),
+                command=lambda a=action: self.run_pixy_action(a),
             ).grid(row=i // columns, column=i % columns, sticky="ew", padx=4, pady=4)
 
         for col in range(columns):
             automation.columnconfigure(col, weight=1)
 
-        custom = ttk.LabelFrame(page, text="Custom cam_ptz.sh command", padding=10)
+        custom = ttk.LabelFrame(page, text="Custom PIXY command", padding=10)
         custom.pack(fill="x", pady=(0, 10))
 
         ttk.Label(custom, text="Command arguments:").grid(
@@ -452,12 +404,12 @@ class PixyUI:
 
         entry = ttk.Entry(custom, textvariable=self.custom_hid_command)
         entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        entry.bind("<Return>", lambda _event: self.run_hid_action(self.custom_hid_command.get()))
+        entry.bind("<Return>", lambda _event: self.run_pixy_action(self.custom_hid_command.get()))
 
         ttk.Button(
             custom,
             text="Run",
-            command=lambda: self.run_hid_action(self.custom_hid_command.get()),
+            command=lambda: self.run_pixy_action(self.custom_hid_command.get()),
         ).grid(row=0, column=2, sticky="ew", padx=4, pady=4)
 
         custom.columnconfigure(1, weight=1)
@@ -520,15 +472,10 @@ def main():
         default="/dev/video0",
         help="V4L2 video device, default: /dev/video0",
     )
-    parser.add_argument(
-        "--script",
-        default="~/bin/cam_ptz.sh",
-        help="Path to PIXY HID helper script, default: ~/bin/cam_ptz.sh",
-    )
     args = parser.parse_args()
 
     root = tk.Tk()
-    PixyUI(root, args.device, args.script)
+    PixyUI(root, args.device)
     root.mainloop()
 
 
