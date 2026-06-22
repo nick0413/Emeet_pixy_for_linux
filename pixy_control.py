@@ -3,6 +3,7 @@
 import errno
 import os
 import pathlib
+import re
 import subprocess
 import time
 
@@ -417,13 +418,18 @@ class PixyController:
                 "--get-ctrl",
                 control_name,
             ])
-            return int(result.stdout.strip().split(":", 1)[1].strip())
+            raw_value = result.stdout.strip().split(":", 1)[1].strip()
+            match = re.search(r"-?\d+", raw_value)
+            if not match:
+                raise PixyControlError(f"Could not parse {control_name} value: {raw_value}")
+            return int(match.group(0))
         except Exception:
             if fallback is not None:
                 return fallback
             raise
 
     def set_control(self, control_name, value):
+        self.prepare_manual_control(control_name)
         self.ensure_control_is_active(control_name)
         self.run_v4l2([
             "-d",
@@ -432,23 +438,39 @@ class PixyController:
             f"{control_name}={int(value)}",
         ])
 
+    def prepare_manual_control(self, control_name):
+        auto_control = {
+            "exposure_time_absolute": ("auto_exposure", 1),
+            "white_balance_temperature": ("white_balance_automatic", 0),
+            "focus_absolute": ("focus_automatic_continuous", 0),
+        }.get(control_name)
+
+        if auto_control is None:
+            return
+
+        auto_name, manual_value = auto_control
+        self.run_v4l2([
+            "-d",
+            self.video_device,
+            "-c",
+            f"{auto_name}={manual_value}",
+        ])
+        time.sleep(0.1)
+
     def ensure_control_is_active(self, control_name):
         if control_name == "exposure_time_absolute" and self.get_control("auto_exposure", 3) != 1:
             raise PixyControlError(
-                "Exposure Time is inactive while Exposure Auto is enabled. "
-                "Click Exposure Manual first."
+                "Exposure Time is inactive while Exposure Auto is enabled."
             )
 
         if control_name == "white_balance_temperature" and self.get_control("white_balance_automatic", 1) != 0:
             raise PixyControlError(
-                "White Balance Temperature is inactive while Auto White Balance is enabled. "
-                "Turn Auto White Balance off first."
+                "White Balance Temperature is inactive while Auto White Balance is enabled."
             )
 
         if control_name == "focus_absolute" and self.get_control("focus_automatic_continuous", 1) != 0:
             raise PixyControlError(
-                "Manual Focus is inactive while Continuous Autofocus is enabled. "
-                "Turn Continuous Autofocus off first."
+                "Manual Focus is inactive while Continuous Autofocus is enabled."
             )
 
     def step_control(self, control_name, delta, minimum, maximum):

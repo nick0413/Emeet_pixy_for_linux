@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EMEET PIXY Control
+Comment=Linux control panel for the EMEET PIXY webcam
+Exec=python3 @APP_DIR@/pixy_ui.py
+Icon=@ICON_PATH@
+Terminal=false
+Categories=AudioVideo;Video;Settings;
+StartupNotify=true

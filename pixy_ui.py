@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
+import os
+import pathlib
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -88,6 +92,17 @@ AUTOMATION_ACTIONS = [
     ("Toggle Auto", "toggle-auto"),
 ]
 
+CONFIG_PATH = (
+    pathlib.Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+    / "emeet-pixy"
+    / "ui_config.json"
+)
+APP_DIR = pathlib.Path(__file__).resolve().parent
+APP_ICON_PATH = APP_DIR / "design_logo.png"
+
+SLIDER_DEFS = {name: (label, minv, maxv, step, default) for name, label, minv, maxv, step, default in V4L2_SLIDERS}
+DEFAULT_SLIDER_MAX_VALUES = {name: maxv for name, _label, _minv, maxv, _step, _default in V4L2_SLIDERS}
+
 
 class ScrollableFrame(ttk.Frame):
     def __init__(self, parent):
@@ -148,6 +163,8 @@ class PixyUI:
         self.slider_vars = {}
         self.slider_widgets = {}
         self.bool_vars = {}
+        self.slider_max_values = self.load_configured_slider_max_values()
+        self.config_vars = {}
         self.custom_hid_command = tk.StringVar(value="status")
 
         root.title("EMEET PIXY Linux Control Panel")
@@ -155,6 +172,46 @@ class PixyUI:
         root.minsize(760, 560)
 
         self.build_ui()
+
+    def load_configured_slider_max_values(self):
+        values = DEFAULT_SLIDER_MAX_VALUES.copy()
+
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return values
+
+        saved_values = data.get("slider_max_values", {})
+        if not isinstance(saved_values, dict):
+            return values
+
+        for name, saved_value in saved_values.items():
+            if name not in SLIDER_DEFS:
+                continue
+
+            _label, minv, _maxv, _step, _default = SLIDER_DEFS[name]
+            try:
+                value = int(saved_value)
+            except (TypeError, ValueError):
+                continue
+
+            if value >= minv:
+                values[name] = value
+
+        return values
+
+    def save_configured_slider_max_values(self):
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(
+                json.dumps({"slider_max_values": self.slider_max_values}, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as e:
+            messagebox.showerror(
+                "Config error",
+                f"Failed to save config:\n\n{CONFIG_PATH}\n\n{e}",
+            )
 
     def v4l2_get(self, control_name, fallback):
         return self.controller.get_control(control_name, fallback)
@@ -214,12 +271,15 @@ class PixyUI:
 
         v4l2_tab = ttk.Frame(notebook)
         hid_tab = ttk.Frame(notebook)
+        config_tab = ttk.Frame(notebook)
 
         notebook.add(v4l2_tab, text="V4L2 / PTZ Controls")
         notebook.add(hid_tab, text="PIXY HID Commands")
+        notebook.add(config_tab, text="Configs")
 
         self.build_v4l2_tab(v4l2_tab)
         self.build_hid_tab(hid_tab)
+        self.build_config_tab(config_tab)
 
     def build_v4l2_tab(self, parent):
         scroll = ScrollableFrame(parent)
@@ -294,6 +354,7 @@ class PixyUI:
 
         for row, (name, label, minv, maxv, step, default) in enumerate(V4L2_SLIDERS):
             value = self.v4l2_get(name, default)
+            configured_max = self.slider_max_values.get(name, maxv)
             var = tk.IntVar(value=value)
             self.slider_vars[name] = var
 
@@ -308,7 +369,7 @@ class PixyUI:
             scale = tk.Scale(
                 sliders,
                 from_=minv,
-                to=maxv,
+                to=configured_max,
                 resolution=step,
                 orient="horizontal",
                 length=440,
@@ -329,23 +390,98 @@ class PixyUI:
         self.refresh_manual_control_states()
 
     def refresh_manual_control_states(self):
-        exposure_auto = self.v4l2_get("auto_exposure", 3)
-        auto_white_balance = self.bool_vars.get("white_balance_automatic")
-        auto_focus = self.bool_vars.get("focus_automatic_continuous")
+        for name, var in self.bool_vars.items():
+            var.set(self.v4l2_get(name, var.get()))
 
-        states = {
-            "exposure_time_absolute": "normal" if exposure_auto == 1 else "disabled",
-            "white_balance_temperature": (
-                "normal" if auto_white_balance is not None and auto_white_balance.get() == 0 else "disabled"
-            ),
-            "focus_absolute": (
-                "normal" if auto_focus is not None and auto_focus.get() == 0 else "disabled"
-            ),
-        }
-
-        for name, state in states.items():
+        for name in ("exposure_time_absolute", "white_balance_temperature", "focus_absolute"):
             if name in self.slider_widgets:
-                self.slider_widgets[name].configure(state=state)
+                self.slider_widgets[name].configure(state="normal")
+
+    def build_config_tab(self, parent):
+        scroll = ScrollableFrame(parent)
+        scroll.pack(fill="both", expand=True)
+
+        page = scroll.scrollable
+
+        max_box = ttk.LabelFrame(page, text="Slider maximum values", padding=10)
+        max_box.pack(fill="both", expand=True, padx=4, pady=(0, 10))
+
+        ttk.Label(max_box, text="Slider").grid(row=0, column=0, sticky="w", padx=4, pady=(0, 6))
+        ttk.Label(max_box, text="Minimum").grid(row=0, column=1, sticky="w", padx=4, pady=(0, 6))
+        ttk.Label(max_box, text="Default Max").grid(row=0, column=2, sticky="w", padx=4, pady=(0, 6))
+        ttk.Label(max_box, text="Configured Max").grid(row=0, column=3, sticky="ew", padx=4, pady=(0, 6))
+
+        for row, (name, label, minv, maxv, _step, _default) in enumerate(V4L2_SLIDERS, start=1):
+            var = tk.StringVar(value=str(self.slider_max_values.get(name, maxv)))
+            self.config_vars[name] = var
+
+            ttk.Label(max_box, text=label, width=28).grid(row=row, column=0, sticky="w", padx=4, pady=3)
+            ttk.Label(max_box, text=str(minv)).grid(row=row, column=1, sticky="w", padx=4, pady=3)
+            ttk.Label(max_box, text=str(maxv)).grid(row=row, column=2, sticky="w", padx=4, pady=3)
+            ttk.Entry(max_box, textvariable=var, width=14).grid(row=row, column=3, sticky="ew", padx=4, pady=3)
+
+        max_box.columnconfigure(3, weight=1)
+
+        actions = ttk.Frame(page)
+        actions.pack(fill="x", padx=4, pady=(0, 10))
+
+        ttk.Button(
+            actions,
+            text="Apply",
+            command=lambda: self.apply_slider_config(save=False),
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            actions,
+            text="Save",
+            command=lambda: self.apply_slider_config(save=True),
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            actions,
+            text="Restore Defaults",
+            command=self.restore_default_slider_config,
+        ).pack(side="left")
+
+    def apply_slider_config(self, save):
+        new_values = {}
+
+        for name, var in self.config_vars.items():
+            label, minv, _maxv, _step, _default = SLIDER_DEFS[name]
+            raw_value = var.get().strip()
+
+            try:
+                value = int(raw_value)
+            except ValueError:
+                messagebox.showerror("Config error", f"{label} max must be a whole number.")
+                return
+
+            if value < minv:
+                messagebox.showerror("Config error", f"{label} max must be at least {minv}.")
+                return
+
+            new_values[name] = value
+
+        self.slider_max_values.update(new_values)
+
+        for name, value in new_values.items():
+            if name in self.slider_widgets:
+                self.slider_widgets[name].configure(to=value)
+            if name in self.slider_vars and self.slider_vars[name].get() > value:
+                self.slider_vars[name].set(value)
+
+        if save:
+            self.save_configured_slider_max_values()
+            messagebox.showinfo("Config saved", f"Slider maximum values saved to:\n\n{CONFIG_PATH}")
+        else:
+            messagebox.showinfo("Config applied", "Slider maximum values updated for this session.")
+
+    def restore_default_slider_config(self):
+        for name, value in DEFAULT_SLIDER_MAX_VALUES.items():
+            if name in self.config_vars:
+                self.config_vars[name].set(str(value))
+
+        self.apply_slider_config(save=True)
 
     def build_hid_tab(self, parent):
         page = ttk.Frame(parent, padding=10)
@@ -475,6 +611,12 @@ def main():
     args = parser.parse_args()
 
     root = tk.Tk()
+    if APP_ICON_PATH.exists():
+        try:
+            root.iconphoto(True, tk.PhotoImage(file=str(APP_ICON_PATH)))
+        except tk.TclError:
+            print(f"Warning: could not load app icon: {APP_ICON_PATH}", file=sys.stderr)
+
     PixyUI(root, args.device)
     root.mainloop()
 
